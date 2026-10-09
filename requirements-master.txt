@@ -1,0 +1,57 @@
+# Dependencies verified for the Master's thesis experiment
+# (BiGAN state novelty vs. BiGAN transition novelty).
+#
+# The repository previously had no dependency manifest at all, so this file
+# records the exact stack the implementation and tests were verified against.
+#
+# Verified environment
+# --------------------
+#   OS            Linux x86_64 (Debian 12, glibc 2.36)
+#   Python        3.11.2
+#   torch         2.14.0        (imported as 2.14.0+cu130)
+#   numpy         2.4.6
+#   gymnasium     1.3.0
+#   ale-py        0.12.1        (provides ALE/MontezumaRevenge-v5 and its ROM)
+#   matplotlib    3.11.2        (thesis figures)
+#   tensorboard   2.21.0        (optional run logging)
+#   pytest        9.1.1         (optional; `python -m unittest` is the primary runner)
+#
+# Installation
+# ------------
+#   python -m pip install -r requirements-master.txt
+#
+# Platform note (important, do not misread the torch pin)
+# -------------------------------------------------------
+#
+#       python -m pip install torch==2.14.0
+#       python -m pip install numpy==2.4.6 gymnasium==1.3.0 ale-py==0.12.1 \
+#           matplotlib==3.11.2 tensorboard==2.21.0
+#
+#   The code itself targets Python 3.9+ and PyTorch 2.x (see README); the pins
+#   above are the versions used for verification, not a hard lower bound.
+#   Exact CUDA wheel availability varies by platform, so no CUDA-specific
+#   package is pinned in this file.
+
+torch==2.14.0
+numpy==2.4.6
+gymnasium==1.3.0
+ale-py==0.12.1
+matplotlib==3.11.2
+tensorboard==2.21.0
+
+# Optional: the default environment (the Noisy-TV maze, `NoisyTVMaze-v0`) is
+# implemented in this repository and needs gymnasium only. Only the ORIGINAL
+# Unity build (`NoisyTVUnity-v0`) needs the extra pieces below:
+#
+#   pillow            the upstream `unityagents` client decodes JPEG frames with
+#                     PIL (it is not pinned here because the client itself ships
+#                     with the environment repository, not with this project)
+#   unityagents       vendored in https://github.com/luchris429/noisy-tv-env;
+#                     install it with `python -m pip install -e path/to/noisy-tv-env`
+#   the player binary download link is in that repository's README; point
+#                     `NoisyTVUnityConfig(file_name=...)` at it, or leave
+#                     `make_noisy_tv_environment("auto")` to use the pure-python
+#                     reconstruction instead.
+
+# Optional test runner; the suite also runs with `python -m unittest discover -s tests`.
+pytest==9.1.1

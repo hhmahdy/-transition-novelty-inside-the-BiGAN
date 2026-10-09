@@ -1,0 +1,25 @@
+# Experiment artifacts produced by the Master's thesis scripts.
+# (The historical `outputs/` directory is already tracked in git and is
+# deliberately NOT ignored here.)
+results/
+runs/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+
+# Upstream environments cloned by scripts/install_noisy_tv_unity.sh
+# (the unityagents client and the Unity player build are not redistributed here).
+third_party/
