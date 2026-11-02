@@ -7,7 +7,16 @@ The Master's experiment compares exactly two intrinsic-reward signals:
 * ``transition`` -- BiGAN action-conditioned transition novelty
                     ``N_T = ||f(E(s_t),a_t) - E(s_{t+1})||_2`` (proposed)
 
-Expected layout (produced by ``scripts/run_master_experiments.sh``)::
+Both conditions can be optimised by PPO (``scripts/run_master_experiments.sh``)
+or by A3C (``scripts/run_master_a3c.sh``). The aggregation is shared: each run's
+``config.json`` decides which optimisation diagnostics are exported (``ppo/*``
+for PPO, ``a3c/*`` for A3C) and how a logged mean reward becomes a cumulative
+return (``rollout_steps * num_parallel_envs`` for PPO,
+``a3c.n_steps * num_parallel_envs * log_interval_updates`` for A3C). PPO
+artefacts are byte-for-byte unchanged by either rule.
+
+Expected layout (produced by ``scripts/run_master_experiments.sh`` or
+``scripts/run_master_a3c.sh``)::
 
     results/master/
     ├── state/seed_0/       config.json  run_info.json  metrics.jsonl  run.log
@@ -71,8 +80,9 @@ SUMMARY_COLUMNS = [
     "episode_count",
 ]
 
-#: Update-level metrics exported to each seed's ``metrics.csv``.
-UPDATE_METRICS = [
+#: Reward and novelty diagnostics logged by every algorithm, whatever the
+#: optimisation rule.
+_REWARD_METRICS = [
     "update",
     "reward/extrinsic",
     "reward/intrinsic",
@@ -80,12 +90,36 @@ UPDATE_METRICS = [
     "novelty/pixel",
     "novelty/feature",
     "novelty/normalized",
+]
+
+#: PPO optimisation diagnostics.
+_PPO_OPTIMISATION_METRICS = [
     "ppo/policy_loss",
     "ppo/value_loss",
     "ppo/entropy",
     "ppo/approximate_kl",
     "ppo/clip_fraction",
     "ppo/learning_rate",
+]
+
+#: A3C optimisation diagnostics. A3C has no importance ratio, so there is no KL
+#: term and no clip fraction; its losses, entropy, gradient norm, and advantages
+#: are logged under ``a3c/*``.
+_A3C_OPTIMISATION_METRICS = [
+    "a3c/policy_loss",
+    "a3c/extrinsic_value_loss",
+    "a3c/intrinsic_value_loss",
+    "a3c/value_loss",
+    "a3c/entropy",
+    "a3c/total_loss",
+    "a3c/gradient_norm",
+    "a3c/learning_rate",
+    "a3c/advantage_mean",
+    "a3c/advantage_std",
+]
+
+#: BiGAN and exploration-model diagnostics, shared by both algorithms.
+_MODEL_METRICS = [
     "bigan/discriminator_loss",
     "bigan/encoder_generator_loss",
     "bigan/reconstruction_loss",
@@ -94,6 +128,60 @@ UPDATE_METRICS = [
     "transition/forward_prediction_loss",
     "transition/feature_matching_loss",
 ]
+
+#: Update-level metrics exported to each seed's ``metrics.csv`` for a PPO run
+#: (``config.json`` has no ``algorithm`` key, or it is ``"ppo"``). The exact
+#: column order of every PPO table written before A3C existed is preserved.
+UPDATE_METRICS = _REWARD_METRICS + _PPO_OPTIMISATION_METRICS + _MODEL_METRICS
+
+#: Update-level metrics exported to each seed's ``metrics.csv`` for an A3C run.
+A3C_UPDATE_METRICS = _REWARD_METRICS + _A3C_OPTIMISATION_METRICS + _MODEL_METRICS
+
+#: Metrics both algorithms report, i.e. everything except the optimisation rule.
+SHARED_UPDATE_METRICS = _REWARD_METRICS + _MODEL_METRICS
+
+
+def update_metrics_for(configuration: Dict[str, Any]) -> List[str]:
+    """Return the ``metrics.csv`` columns appropriate for one run.
+
+    Input: Parsed ``config.json`` of the run (empty when unavailable).
+    Output: Column list; ``a3c/*`` diagnostics for an A3C run, ``ppo/*``
+        otherwise.
+    Mathematical meaning: None; the exported columns must match the objective
+        the run actually optimised, so a PPO table keeps its PPO columns and an
+        A3C table reports its own.
+    """
+    algorithm = str(configuration.get("algorithm", "ppo"))
+    return A3C_UPDATE_METRICS if algorithm == "a3c" else UPDATE_METRICS
+
+
+def samples_per_logged_update(configuration: Dict[str, Any]) -> int:
+    """Return the environment transitions represented by one logged record.
+
+    Input: Parsed ``config.json`` of the run.
+    Output: Positive integer, or ``0`` when the geometry cannot be recovered.
+
+    One logged ``metrics.jsonl`` record reports the mean reward over the
+    transitions collected since the previous record:
+
+    * PPO -- one record per rollout, i.e. ``rollout_steps * num_parallel_envs``
+      transitions (unchanged expression, so existing PPO totals are identical);
+    * A3C -- one record per ``log_interval_updates`` applied actor-learner
+      updates, each consuming an ``n_steps`` segment in every environment, i.e.
+      ``a3c.n_steps * num_parallel_envs * training.log_interval_updates``.
+    Mathematical meaning: Converts a mean reward per update record back into a
+        cumulative return, so ``total_extrinsic_return`` stays comparable
+        between the two algorithms.
+    """
+    num_envs = int(configuration.get("environment", {}).get("num_parallel_envs", 0) or 0)
+    if str(configuration.get("algorithm", "ppo")) == "a3c":
+        n_steps = int(configuration.get("a3c", {}).get("n_steps", 0) or 0)
+        log_interval = int(
+            configuration.get("training", {}).get("log_interval_updates", 1) or 1
+        )
+        return n_steps * num_envs * log_interval
+    rollout_steps = int(configuration.get("ppo", {}).get("rollout_steps", 0) or 0)
+    return rollout_steps * num_envs
 
 
 @dataclass(frozen=True)
@@ -113,6 +201,9 @@ class RunSummary:
     mean_intrinsic_reward: Optional[float]
     environment_id: Optional[str]
     git_commit: Optional[str]
+    #: Optimisation rule that produced the run (``"ppo"`` or ``"a3c"``); read
+    #: from ``config.json`` and defaulted to ``"ppo"`` for pre-existing runs.
+    algorithm: str = "ppo"
     notes: List[str] = field(default_factory=list)
 
 
@@ -209,7 +300,8 @@ def write_seed_metrics_csv(run_directory: Path) -> Optional[Path]:
     update_records = [record for record in records if "update" in record["metrics"]]
     if not update_records:
         return None
-    columns = ["step"] + UPDATE_METRICS
+    metric_columns = update_metrics_for(_read_json(run_directory / "config.json"))
+    columns = ["step"] + metric_columns
     path = run_directory / "metrics.csv"
     with path.open("w", newline="", encoding="utf-8") as file:
         writer = csv.writer(file)
@@ -217,7 +309,7 @@ def write_seed_metrics_csv(run_directory: Path) -> Optional[Path]:
         for record in update_records:
             metrics = record["metrics"]
             writer.writerow(
-                [record["step"]] + [metrics.get(column, "") for column in UPDATE_METRICS]
+                [record["step"]] + [metrics.get(column, "") for column in metric_columns]
             )
     return path
 
@@ -250,10 +342,9 @@ def summarize_run(method: str, seed: int, run_directory: Path, final_window: int
     _, intrinsic_means = load_training_metric(metrics_path, "reward/intrinsic")
 
     configuration = _read_json(run_directory / "config.json")
-    rollout_steps = int(configuration.get("ppo", {}).get("rollout_steps", 0))
-    num_envs = int(configuration.get("environment", {}).get("num_parallel_envs", 0))
+    algorithm = str(configuration.get("algorithm", "ppo"))
     total_environment_steps = int(configuration.get("training", {}).get("total_environment_steps", 0))
-    samples_per_update = rollout_steps * num_envs
+    samples_per_update = samples_per_logged_update(configuration)
     if samples_per_update > 0 and extrinsic_means.size:
         total_extrinsic_return = float(extrinsic_means.sum() * samples_per_update)
     else:
@@ -290,6 +381,7 @@ def summarize_run(method: str, seed: int, run_directory: Path, final_window: int
         mean_intrinsic_reward=float(intrinsic_means.mean()) if intrinsic_means.size else None,
         environment_id=environment_id,
         git_commit=git_commit,
+        algorithm=algorithm,
         notes=notes,
     )
 
@@ -418,6 +510,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     print(f"Runs aggregated: {len(summaries)}")
     print(f"Summary CSV:     {summary_path}")
     print(f"Statistics CSV:  {stats_path}")
+    print("Optimisation    : " + ", ".join(sorted({s.algorithm for s in summaries})))
     print()
     header = f"| {'Method':<11} | {'Seed':>4} | {'Final Score':>12} | {'Total Extrinsic':>16} | {'First Reward':>13} | {'Episodes':>8} |"
     print(header)

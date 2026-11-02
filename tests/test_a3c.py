@@ -22,9 +22,12 @@ All runs use tiny CPU environments so the suite finishes in seconds.
 
 from __future__ import annotations
 
+import csv
 import json
 import math
+import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -1247,6 +1250,390 @@ class A3CReproducibilityTest(unittest.TestCase):
         self.assertEqual(len(set(environment_seeds)), 4)
         self.assertEqual(len(set(action_seeds)), 4)
         self.assertEqual(len(set(environment_seeds) & set(action_seeds)), 0)
+
+
+class A3CExperimentScriptTest(unittest.TestCase):
+    """``scripts/run_master_a3c.sh``: the A3C driver of the Master's experiment.
+
+    The driver must (a) launch both conditions with ``--algorithm a3c``, (b) keep
+    the results layout and aggregation artefacts of
+    ``scripts/run_master_experiments.sh``, and (c) refuse an inconsistent
+    schedule before spending any compute.
+    """
+
+    SCRIPT = Path("scripts") / "run_master_a3c.sh"
+
+    def tearDown(self) -> None:
+        """Clear the deterministic-algorithms flag set by the runs.
+
+        Input: This test case.
+        Output: No value.
+        Mathematical meaning: Restores global PyTorch state.
+        """
+        torch.use_deterministic_algorithms(False)
+
+    def _tiny_script_environment(self) -> Dict[str, str]:
+        """Return the environment variables of a seconds-long driver run.
+
+        Input: None.
+        Output: Mapping of the driver's small-scale settings.
+        Mathematical meaning: Executes the same code path as the thesis run at a
+            scale where two conditions finish in seconds on CPU.
+        """
+        return {
+            "PYTHON": sys.executable,
+            "ENV_NAME": "CartPole-v1",
+            "DEVICE": "cpu",
+            "NUM_WORKERS": "2",
+            "N_STEPS": "8",
+            "TOTAL_STEPS": "128",
+            "ROLLOUT_STEPS": "8",
+            "MINIBATCH_SIZE": "4",
+            "BIGAN_BATCH_SIZE": "8",
+            "SEEDS": "0",
+            "METHODS": "state transition",
+            "DISABLE_TENSORBOARD": "1",
+            "DISABLE_PLOTS": "1",
+        }
+
+    def test_script_is_syntactically_valid(self) -> None:
+        """The driver must be valid bash.
+
+        Input: ``bash -n scripts/run_master_a3c.sh``.
+        Output: Exit status ``0``.
+        Mathematical meaning: None; a syntax error would only surface after a
+            long experiment had been prepared.
+        """
+        completed = subprocess.run(
+            ["bash", "-n", str(self.SCRIPT)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_inconsistent_schedule_fails_before_training(self) -> None:
+        """An A3C schedule that does not divide the budget must be rejected.
+
+        Input: ``TOTAL_STEPS=130`` with ``NUM_WORKERS*N_STEPS=16``.
+        Output: Non-zero exit status and an explanatory message; no run
+            directory is created.
+        Mathematical meaning: Mirrors ``ExperimentConfig``'s A3C divisibility
+            rule in the shell layer so a broken sweep fails immediately.
+        """
+        directory = Path(tempfile.mkdtemp(prefix="a3c_script_bad_"))
+        self.addCleanup(shutil.rmtree, directory, True)
+        environment = dict(self._tiny_script_environment())
+        environment.update(
+            {
+                "TOTAL_STEPS": "130",
+                "METHODS": "state",
+                "OUTPUT_DIR": str(directory / "results"),
+                "RUN_AGGREGATION": "0",
+            }
+        )
+        completed = subprocess.run(
+            ["bash", str(self.SCRIPT)],
+            capture_output=True,
+            text=True,
+            check=False,
+            env={**os.environ, **environment},
+        )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("must be divisible by", completed.stdout + completed.stderr)
+        self.assertFalse((directory / "results" / "state" / "seed_0").exists())
+
+    def test_driver_trains_both_conditions_and_aggregates(self) -> None:
+        """The driver runs both Master's conditions with A3C end to end.
+
+        Input: A tiny two-condition driver run on CartPole.
+        Output: Exit status ``0``; per-condition runs, CSVs, and figures that
+            record the A3C algorithm.
+        Mathematical meaning: Confirms the A3C experiment pipeline -- including
+            the shared BiGAN/novelty/Equation (5) reward path -- is launchable
+            through the same interface as the PPO experiment.
+        """
+        directory = Path(tempfile.mkdtemp(prefix="a3c_script_"))
+        self.addCleanup(shutil.rmtree, directory, True)
+        results = directory / "results"
+        environment = dict(self._tiny_script_environment())
+        environment["OUTPUT_DIR"] = str(results)
+        completed = subprocess.run(
+            ["bash", str(self.SCRIPT)],
+            capture_output=True,
+            text=True,
+            check=False,
+            env={**os.environ, **environment},
+        )
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+
+        for method in ("state", "transition"):
+            run_directory = results / method / "seed_0"
+            for name in ("config.json", "run_info.json", "metrics.jsonl", "run.log", "training.log"):
+                self.assertTrue((run_directory / name).is_file(), f"missing {method}/{name}")
+            configuration = json.loads((run_directory / "config.json").read_text())
+            self.assertEqual(configuration["algorithm"], "a3c")
+            self.assertEqual(configuration["a3c"]["n_steps"], 8)
+            run_info = json.loads((run_directory / "run_info.json").read_text())
+            self.assertEqual(run_info["algorithm"], "a3c")
+            records = [
+                json.loads(line)
+                for line in (run_directory / "metrics.jsonl").read_text().splitlines()
+            ]
+            self.assertTrue(any("a3c" in record["metrics"] for record in records))
+            self.assertFalse(
+                any("ppo" in record["metrics"] for record in records),
+                "an A3C run must not log PPO optimisation metrics",
+            )
+
+        summary = results / "master_summary.csv"
+        self.assertTrue(summary.is_file())
+        self.assertTrue((results / "master_summary_stats.csv").is_file())
+        rows = list(csv.DictReader(summary.open(encoding="utf-8")))
+        self.assertEqual([row["method"] for row in rows], ["state", "transition"])
+
+        # The A3C sample geometry must be used: one logged record covers
+        # NUM_WORKERS * N_STEPS transitions, not the PPO rollout geometry.
+        for row in rows:
+            run_directory = results / row["method"] / "seed_0"
+            records = [
+                json.loads(line)
+                for line in (run_directory / "metrics.jsonl").read_text().splitlines()
+            ]
+            means = [
+                record["metrics"]["reward/extrinsic"]
+                for record in records
+                if "reward/extrinsic" in record["metrics"]
+            ]
+            expected = sum(means) * 2 * 8
+            self.assertAlmostEqual(
+                float(row["total_extrinsic_return"]), expected, places=3
+            )
+
+        figures = results / "figures"
+        self.assertTrue((figures / "plot1_game_score_vs_steps.png").is_file())
+
+        # The per-seed metric table must carry the A3C diagnostics.
+        for method in ("state", "transition"):
+            header = (results / method / "seed_0" / "metrics.csv").read_text(
+                encoding="utf-8"
+            ).splitlines()[0]
+            self.assertIn("a3c/policy_loss", header)
+            self.assertIn("a3c/gradient_norm", header)
+            self.assertNotIn("ppo/policy_loss", header)
+
+    def test_driver_can_run_the_matched_ppo_control(self) -> None:
+        """``ALGORITHM=ppo`` gives the matched control through the same driver.
+
+        Input: A tiny one-condition driver run with ``ALGORITHM=ppo``.
+        Output: A PPO run that records ``algorithm="ppo"`` and keeps the PPO
+            metric columns.
+        Mathematical meaning: Confirms the driver's algorithm knob does not
+            leak A3C settings into a PPO run.
+        """
+        directory = Path(tempfile.mkdtemp(prefix="a3c_script_ppo_"))
+        self.addCleanup(shutil.rmtree, directory, True)
+        results = directory / "results"
+        environment = dict(self._tiny_script_environment())
+        environment.update(
+            {
+                "ALGORITHM": "ppo",
+                "METHODS": "state",
+                "OUTPUT_DIR": str(results),
+                "RUN_AGGREGATION": "0",
+            }
+        )
+        completed = subprocess.run(
+            ["bash", str(self.SCRIPT)],
+            capture_output=True,
+            text=True,
+            check=False,
+            env={**os.environ, **environment},
+        )
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        configuration = json.loads((results / "state" / "seed_0" / "config.json").read_text())
+        self.assertEqual(configuration["algorithm"], "ppo")
+        records = [
+            json.loads(line)
+            for line in (results / "state" / "seed_0" / "metrics.jsonl").read_text().splitlines()
+        ]
+        self.assertTrue(any("ppo" in record["metrics"] for record in records))
+        # Aggregation was skipped, so the CSV summary must be absent.
+        self.assertFalse((results / "master_summary.csv").exists())
+
+
+class MasterAggregationAlgorithmTest(unittest.TestCase):
+    """The aggregation scripts must handle A3C runs without changing PPO ones."""
+
+    @staticmethod
+    def _script_module() -> Any:
+        """Import ``scripts/summarize_master_results.py`` as a module.
+
+        Input: None.
+        Output: The imported module object.
+        Mathematical meaning: None; exposes the aggregation helpers to tests.
+        """
+        import importlib.util
+
+        path = Path("scripts") / "summarize_master_results.py"
+        specification = importlib.util.spec_from_file_location(
+            "summarize_master_results_under_test", path
+        )
+        module = importlib.util.module_from_spec(specification)
+        assert specification.loader is not None
+        # ``from __future__ import annotations`` turns the dataclass field types
+        # into strings, and dataclasses resolves them through sys.modules, so
+        # the module must be registered before it is executed.
+        sys.modules[specification.name] = module
+        try:
+            specification.loader.exec_module(module)
+        except BaseException:
+            sys.modules.pop(specification.name, None)
+            raise
+        return module
+
+    def test_sample_geometry_matches_each_algorithm(self) -> None:
+        """One logged record must cover the right number of transitions.
+
+        Input: PPO and A3C ``config.json``-shaped mappings.
+        Output: ``rollout_steps*num_envs`` for PPO and
+            ``n_steps*num_envs*log_interval`` for A3C.
+        Mathematical meaning: Makes ``total_extrinsic_return`` comparable across
+            algorithms instead of silently scaling A3C means by a PPO rollout.
+        """
+        module = self._script_module()
+        ppo_configuration = {
+            "environment": {"num_parallel_envs": 4},
+            "ppo": {"rollout_steps": 32},
+        }
+        a3c_configuration = {
+            "algorithm": "a3c",
+            "environment": {"num_parallel_envs": 4},
+            "ppo": {"rollout_steps": 32},
+            "a3c": {"n_steps": 8},
+            "training": {"log_interval_updates": 1},
+        }
+        self.assertEqual(module.samples_per_logged_update(ppo_configuration), 128)
+        self.assertEqual(module.samples_per_logged_update(a3c_configuration), 32)
+        a3c_configuration["training"]["log_interval_updates"] = 3
+        self.assertEqual(module.samples_per_logged_update(a3c_configuration), 96)
+
+    def test_update_metric_columns_follow_the_algorithm(self) -> None:
+        """The exported CSV columns must match the optimised objective.
+
+        Input: PPO and A3C configurations.
+        Output: ``ppo/*`` columns for PPO, ``a3c/*`` columns for A3C.
+        Mathematical meaning: None; keeps a PPO table unchanged and gives an
+            A3C table its own loss diagnostics.
+        """
+        module = self._script_module()
+        ppo_columns = module.update_metrics_for({})
+        a3c_columns = module.update_metrics_for({"algorithm": "a3c"})
+        # The PPO column order must stay exactly as it was before A3C existed,
+        # so existing PPO tables diff cleanly against new ones.
+        self.assertEqual(
+            ppo_columns,
+            [
+                "update",
+                "reward/extrinsic",
+                "reward/intrinsic",
+                "reward/total",
+                "novelty/pixel",
+                "novelty/feature",
+                "novelty/normalized",
+                "ppo/policy_loss",
+                "ppo/value_loss",
+                "ppo/entropy",
+                "ppo/approximate_kl",
+                "ppo/clip_fraction",
+                "ppo/learning_rate",
+                "bigan/discriminator_loss",
+                "bigan/encoder_generator_loss",
+                "bigan/reconstruction_loss",
+                "transition/forward_model_mse",
+                "transition/mean_prediction_error",
+                "transition/forward_prediction_loss",
+                "transition/feature_matching_loss",
+            ],
+        )
+        self.assertIn("a3c/policy_loss", a3c_columns)
+        self.assertIn("a3c/gradient_norm", a3c_columns)
+        self.assertNotIn("ppo/policy_loss", a3c_columns)
+        # A3C has no importance ratio, so it must not claim PPO-only columns.
+        for column in ("ppo/approximate_kl", "ppo/clip_fraction"):
+            self.assertNotIn(column, a3c_columns)
+        # Both algorithms report the same reward, novelty, BiGAN, and
+        # transition diagnostics, in the same order.
+        for column in module.SHARED_UPDATE_METRICS:
+            self.assertIn(column, ppo_columns)
+            self.assertIn(column, a3c_columns)
+
+    def test_summary_rows_of_a3c_and_ppo_runs(self) -> None:
+        """``summarize_run`` must total A3C and PPO rewards correctly.
+
+        Input: Two synthetic run directories that differ only in ``algorithm``
+            and the recorded geometry.
+        Output: ``total_extrinsic_return`` scaled by the matching geometry and
+            the recorded algorithm reported per run.
+        Mathematical meaning: Verifies the cumulative extrinsic return is the
+            same physical quantity for both algorithms.
+        """
+        module = self._script_module()
+        results = Path(tempfile.mkdtemp(prefix="agg_"))
+        self.addCleanup(shutil.rmtree, results, True)
+        for name, configuration in (
+            (
+                "ppo",
+                {
+                    "seed": {"seed": 0},
+                    "environment": {"num_parallel_envs": 4},
+                    "ppo": {"rollout_steps": 8},
+                    "training": {"total_environment_steps": 64, "log_interval_updates": 1},
+                },
+            ),
+            (
+                "a3c",
+                {
+                    "algorithm": "a3c",
+                    "environment": {"num_parallel_envs": 4},
+                    "ppo": {"rollout_steps": 8},
+                    "a3c": {"n_steps": 4},
+                    "training": {"total_environment_steps": 64, "log_interval_updates": 1},
+                },
+            ),
+        ):
+            run_directory = results / name / "seed_0"
+            run_directory.mkdir(parents=True)
+            (run_directory / "config.json").write_text(json.dumps(configuration))
+            (run_directory / "run_info.json").write_text(
+                json.dumps({"environment_id": "Tiny-v0", "git_commit": "deadbeef"})
+            )
+            lines = []
+            for update in range(2):
+                lines.append(
+                    json.dumps(
+                        {
+                            "step": (update + 1) * 4 * int(
+                                configuration.get("a3c", {}).get("n_steps", 8)
+                            ),
+                            "metrics": {
+                                "update": update,
+                                "reward/extrinsic": 0.5,
+                                "reward/intrinsic": 0.25,
+                            },
+                        }
+                    )
+                )
+            (run_directory / "metrics.jsonl").write_text("\n".join(lines) + "\n")
+
+        ppo_summary = module.summarize_run("state", 0, results / "ppo" / "seed_0", 10)
+        a3c_summary = module.summarize_run("state", 0, results / "a3c" / "seed_0", 10)
+        self.assertEqual(ppo_summary.algorithm, "ppo")
+        self.assertEqual(a3c_summary.algorithm, "a3c")
+        # Two records with mean 0.5 each: PPO covers 2 * (8 * 4) transitions,
+        # A3C covers 2 * (4 * 4) transitions.
+        self.assertAlmostEqual(ppo_summary.total_extrinsic_return, 0.5 * 2 * 32)
+        self.assertAlmostEqual(a3c_summary.total_extrinsic_return, 0.5 * 2 * 16)
 
 
 class A3CCommandLineTest(unittest.TestCase):

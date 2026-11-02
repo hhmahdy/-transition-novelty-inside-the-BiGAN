@@ -220,6 +220,10 @@ smoke test on the Noisy-TV maze with
 The command lines, the `DEVICE=auto` default, and the scale overrides are given
 in the environment section above.
 
+To run the identical two conditions with the A3C agent instead of PPO, use
+`bash scripts/run_master_a3c.sh` (same layout, same aggregation; see the A3C
+section below).
+
 The driver runs `state` seeds 0,1,2 then `transition` seeds 0,1,2, writes
 `training.log` per run, prints the git commit before training, verifies
 dependencies and schedule consistency, refuses to write into an existing run
@@ -539,7 +543,8 @@ Adventurer/
 │   ├── run_metadata.py         # run_info.json execution metadata
 │   └── seed.py
 ├── scripts/
-│   ├── run_master_experiments.sh   # Master's experiment driver
+│   ├── run_master_experiments.sh   # Master's experiment driver (PPO)
+│   ├── run_master_a3c.sh           # the same experiment driven by A3C
 │   ├── smoke_master.sh             # tiny CPU smoke test
 │   ├── smoke_unity_path.sh         # NoisyTVUnity-v0 smoke run, no Unity build needed
 │   ├── install_noisy_tv_unity.sh   # clone the client, fetch the Unity player
@@ -1205,6 +1210,55 @@ encoder and a single novelty normaliser for all actor-learners: with separate
 processes each worker would need its own drifting copy of the encoder and its own
 running Equation (5) statistics, which would change the intrinsic-reward signal
 the thesis measures.
+
+### Running the Master's experiment with A3C
+
+`scripts/run_master_a3c.sh` is the A3C counterpart of
+`scripts/run_master_experiments.sh`. It runs the *same* two conditions
+(`--method state`, `--method transition`), over the same seeds, with the same
+BiGAN, novelty, Equation (5) and logging configuration; only the optimisation
+rule differs. It writes the same run layout and produces the same CSV summaries
+and figures, so a PPO results directory and an A3C results directory can be
+compared directly.
+
+```bash
+# default scale: NoisyTVMaze-v0, 8 actor-learners, 20-step segments, seeds 0 1 2
+bash scripts/run_master_a3c.sh
+
+# quick CPU scale
+DEVICE=cpu NUM_WORKERS=8 TOTAL_STEPS=1024000 SEEDS="0 1 2" \
+    bash scripts/run_master_a3c.sh
+
+# the Atari benchmark
+ENV_NAME=ALE/MontezumaRevenge-v5 DEVICE=cuda NUM_WORKERS=16 TOTAL_STEPS=12288000 \
+    bash scripts/run_master_a3c.sh
+
+# matched PPO control through the same driver (geometry falls back to the PPO rollout)
+ALGORITHM=ppo ROLLOUT_STEPS=32 bash scripts/run_master_a3c.sh
+```
+
+The driver validates the A3C schedule before spending compute
+(`TOTAL_STEPS` must divide `NUM_WORKERS * N_STEPS`), keeps the PPO rollout
+geometry valid because `ExperimentConfig` validates it for every run, verifies
+that each finished run's `config.json` records the requested algorithm, refuses
+to append to an existing run directory (`OVERWRITE=1` overrides), and stops on
+the first failed run. Its knobs are `ALGORITHM` (`a3c`/`ppo`), `NUM_WORKERS`,
+`N_STEPS`, `BIGAN_UPDATE_INTERVAL`, `TOTAL_STEPS`, `ROLLOUT_STEPS`,
+`MINIBATCH_SIZE`, `BIGAN_BATCH_SIZE`, `SEEDS`, `METHODS`, `OUTPUT_DIR`
+(default `results/master_a3c`), `PLOT_INTERVAL_UPDATES`,
+`DISABLE_TENSORBOARD`, `DISABLE_PLOTS`, `RUN_AGGREGATION`, `OVERWRITE`,
+`EXTRA_ARGS`, and `PYTHON`/`VENV`.
+
+Aggregation is shared with the PPO experiment. `scripts/summarize_master_results.py`
+reads each run's `config.json` and therefore
+
+* converts the logged mean reward back to a cumulative return with the matching
+  geometry -- `rollout_steps * num_parallel_envs` for PPO (unchanged) and
+  `a3c.n_steps * num_parallel_envs * log_interval_updates` for A3C, so
+  `total_extrinsic_return` means the same physical quantity in both tables;
+* writes `a3c/*` optimisation columns into an A3C run's `metrics.csv` (PPO runs
+  keep exactly their previous `ppo/*` columns), and prints the algorithm(s) it
+  found.
 
 ### Logged metrics
 
