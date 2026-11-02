@@ -507,10 +507,12 @@ Adventurer/
 ├── config.py
 ├── main.py
 ├── trainer.py
+├── trainer_a3c.py              # A3C training loop (additive; PPO untouched)
 ├── agent/
 │   ├── actor.py
 │   ├── critic.py
 │   ├── ppo.py
+│   ├── a3c.py                  # A3C actor-critic, shared network, shared Adam
 │   ├── rollout_buffer.py
 │   └── advantage.py
 ├── bigan/
@@ -543,6 +545,8 @@ Adventurer/
 │   ├── install_noisy_tv_unity.sh   # clone the client, fetch the Unity player
 │   ├── summarize_master_results.py # master_summary.csv + per-seed metrics.csv
 │   └── plot_master_results.py      # the five thesis figures
+├── workers/
+│   └── a3c_worker.py           # asynchronous actor-learner (one per environment)
 ├── environments/
 │   ├── adapter.py
 │   ├── noisy_tv_maze.py        # Noisy-TV maze of the ICLR-2019 study [default ENV_NAME]
@@ -554,6 +558,7 @@ Adventurer/
 └── tests/
     ├── fixtures/
     │   └── fake_tv_maze_player.py    # player half of the upstream protocol (tests only)
+    ├── test_a3c.py                   # A3C validation suite (PPO regression, novelty equality, stability)
     ├── test_master_transition.py     # Master's method tests + smoke runs
     ├── test_noisy_tv_maze.py         # Noisy-TV maze + Unity adapter tests
     ├── test_noisy_tv_unity_integration.py  # the real client + protocol, no Unity binary
@@ -650,7 +655,10 @@ All defaults are defined in `config.py` using frozen dataclasses:
 - `BiGANConfig`: latent/feature dimensions and adversarial update schedule.
 - `NoveltyConfig`: Eq. (4) convex-mixture parameter `alpha` and intrinsic-reward scale. The default is `alpha=0.9`.
 - `TrainingConfig`: total steps, device, logging, and reward mixing.
-- `ExperimentConfig`: complete cross-component validation.
+- `A3CConfig`: the only A3C-specific settings (`n_steps`, `bigan_update_interval`);
+  every other A3C quantity is an existing PPO/environment setting.
+- `ExperimentConfig`: complete cross-component validation, including
+  `algorithm` (`"ppo"` by default, or `"a3c"`).
 
 The command-line entry point discovers the actual environment observation and
 action-space dimensions and combines them with the configured algorithmic
@@ -1128,6 +1136,102 @@ Comparing Adventurer's `pixel_loss` and `feature_loss` against the discrepancy
 bonus therefore only requires reading `novelty/pixel`, `novelty/feature`,
 `intrinsic/latent_distance`, and `reward/intrinsic` from the same JSONL or
 TensorBoard stream of each run.
+
+## Asynchronous Advantage Actor-Critic (A3C)
+
+`--algorithm a3c` trains the same Adventurer exploration pipeline with an
+asynchronous advantage actor-critic agent instead of PPO. `--algorithm ppo`
+remains the default, and no existing command changes meaning.
+
+```bash
+# Standard agent configuration (no intrinsic exploration advantage), CPU-friendly
+python main.py --algorithm a3c --env CartPole-v1 --num-parallel-envs 4 \
+    --total-environment-steps 5120 --rollout-steps 32 --minibatch-size 8 \
+    --a3c-n-steps 20 --intrinsic-advantage-coefficient 0.0
+
+# BiGAN state novelty + A3C (Master's baseline, Experiment A)
+python main.py --algorithm a3c --method state --env NoisyTVMaze-v0 \
+    --num-parallel-envs 8 --total-environment-steps 1024000 \
+    --a3c-n-steps 20
+
+# BiGAN transition novelty + A3C (Master's method, Experiment B)
+python main.py --algorithm a3c --method transition --env NoisyTVMaze-v0 \
+    --num-parallel-envs 8 --total-environment-steps 1024000 \
+    --a3c-n-steps 20
+```
+
+Every other selector (`--method`, `--novelty`, `--eme`, `--state-alpha`,
+`--freeze-encoder-after-updates`, ...) applies to both algorithms, and both write
+the same `config.json`, `metrics.jsonl`, `run.log`, `run_info.json`, TensorBoard,
+and figure artefacts into the configured output directory.
+
+### What is shared with PPO
+
+The A3C trainer is a subclass of `AdventurerTrainer`, so it is built by the same
+initialiser: the same environments and preprocessing, the same
+`ActorNetwork`/`DualCriticNetwork`, the same BiGAN encoder/generator/discriminator
+and adversarial objective, the same novelty estimators and Equation (5) running
+normalisation, the same two reward streams and separate extrinsic/intrinsic
+critics, the same termination/truncation semantics (termination masks the
+bootstrap, truncation keeps it), and the same logging conventions. The n-step
+advantages are computed by the *existing* `compute_two_stream_returns_and_advantages`
+GAE implementation, truncated at `a3c.n_steps`, so the policy advantage remains
+`A^e + beta A^i`.
+
+### What A3C adds
+
+| Component | Implementation |
+|-----------|----------------|
+| Actor-critic | `agent/a3c.py::A3CActorCritic` composing the existing `ActorNetwork` (policy) and `DualCriticNetwork` (two value streams) |
+| Shared global network | one `A3CActorCritic` plus one shared `torch.optim.Adam` in `agent/a3c.py::A3CAgent` |
+| Local worker networks | `A3CAgent.new_local_network()` deep copies the global network; `synchronize_local()` pulls the shared parameters at the start of every segment |
+| Asynchronous workers | `workers/a3c_worker.py::A3CWorker`, one thread per parallel environment, each with its own seeded environment stream and action-sampling `torch.Generator` |
+| Gradient synchronisation | each worker clips its local gradients with `PPOConfig.max_grad_norm` and installs them into the shared parameters under a lock, then the shared Adam step runs once |
+| n-step returns | `a3c.n_steps` transitions per segment; returns are the project's GAE truncated at `n`, with `terminated` masking the bootstrap |
+| Entropy regularisation | `PPOConfig.entropy_coefficient` |
+| Action spaces | the actor's own `Categorical` policy for discrete spaces and `Normal` policy for continuous ones; nothing assumes discrete actions |
+| BiGAN / forward-model schedule | one BiGAN (and latent forward-model) update per `a3c.bigan_update_interval` applied actor-learner updates, serialised by the exploration lock |
+
+The number of actor-learners is `--num-parallel-envs` (each actor-learner drives
+exactly one environment), so the flag keeps its original meaning. A3C introduces
+exactly two new knobs, `--a3c-n-steps` (default `20`) and
+`--a3c-bigan-update-interval` (default `1`).
+
+### Why threads
+
+The original A3C actor-learners are CPU threads of one process that share a
+global network, which is what is implemented here. It also keeps a single BiGAN
+encoder and a single novelty normaliser for all actor-learners: with separate
+processes each worker would need its own drifting copy of the encoder and its own
+running Equation (5) statistics, which would change the intrinsic-reward signal
+the thesis measures.
+
+### Logged metrics
+
+A3C logs the same `reward/*`, `novelty/*`, `bigan/*`, `transition/*`, and
+`intrinsic/*` tags as PPO (they are the same quantities), and puts its own
+optimisation diagnostics under `a3c/*` instead of `ppo/*` because the objective
+differs: `a3c/policy_loss`, `a3c/extrinsic_value_loss`,
+`a3c/intrinsic_value_loss`, `a3c/value_loss`, `a3c/entropy`, `a3c/total_loss`,
+`a3c/gradient_norm`, `a3c/learning_rate`, `a3c/advantage_mean`,
+`a3c/advantage_std`. Each record also carries `"algorithm": "a3c"`.
+
+### Reproducibility
+
+`--seed` seeds the process, the network initialisation, and every actor-learner's
+derived environment and action-sampling streams (`derive_seed`). A run with one
+actor-learner is bit-for-bit repeatable for a fixed stack; with several
+actor-learners the interleaving of asynchronous updates is inherently
+non-deterministic, exactly as in the original A3C, while each worker's own
+trajectory stream remains seeded.
+
+### Known limitations
+
+- `--resettable` (Algorithm 2 episodic-memory state restoration) is rejected with
+  `--algorithm a3c`: it is defined per batched PPO rollout index and is off by
+  default and outside the Master's experiment.
+- A3C reads `--num-parallel-envs` as its actor-learner count, so the default `96`
+  creates 96 threads; use a smaller value (e.g. `8`) for A3C runs.
 
 ## Extending the Project
 

@@ -17,6 +17,15 @@ ambiguous or unfair comparison cannot be launched by accident.
 Every run writes ``config.json`` (experimental configuration) and
 ``run_info.json`` (execution/reproducibility metadata: git commit, library
 versions, resolved device, key settings).
+
+Algorithm selection
+-------------------
+``--algorithm ppo`` (default) runs the existing PPO trainer unchanged.
+``--algorithm a3c`` runs the asynchronous advantage actor-critic trainer added
+in :mod:`trainer_a3c`, with the identical environment, preprocessing, BiGAN,
+novelty, intrinsic-reward, and logging configuration. ``--method``,
+``--novelty``, ``--eme``, and every other experiment selector apply to both
+algorithms.
 """
 
 from __future__ import annotations
@@ -26,6 +35,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from config import (
+    ALGORITHMS,
     MASTER_METHODS,
     DeviceType,
     EnvironmentConfig,
@@ -36,6 +46,7 @@ from config import (
 from environments.adapter import SingleEnvironmentAdapter, make_gymnasium_environment
 from environments.vector_adapter import VectorEnvironmentAdapter
 from trainer import AdventurerTrainer
+from trainer_a3c import A3CTrainer
 from evaluation.comparison import save_game_score_comparison
 from utils.seed import derive_seed
 from utils.logger import ExperimentLogger
@@ -123,6 +134,36 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.3,
         help="single beta applied to intrinsic advantage after independent GAE",
+    )
+    parser.add_argument(
+        "--algorithm",
+        choices=list(ALGORITHMS),
+        default="ppo",
+        help=(
+            "reinforcement-learning algorithm: 'ppo' is the existing Adventurer "
+            "implementation (default) and 'a3c' is the asynchronous advantage "
+            "actor-critic agent; both use the same environment, preprocessing, "
+            "BiGAN, novelty and intrinsic-reward settings"
+        ),
+    )
+    parser.add_argument(
+        "--a3c-n-steps",
+        type=int,
+        default=None,
+        help=(
+            "A3C n-step return horizon per actor-learner segment "
+            "(default: config.A3CConfig.n_steps)"
+        ),
+    )
+    parser.add_argument(
+        "--a3c-bigan-update-interval",
+        type=int,
+        default=None,
+        help=(
+            "applied A3C updates per BiGAN/forward-model update, the A3C "
+            "analogue of PPO's one-BiGAN-update-per-rollout schedule "
+            "(default: config.A3CConfig.bigan_update_interval)"
+        ),
     )
     parser.add_argument(
         "--method",
@@ -448,6 +489,20 @@ def build_config(
     )
     bigan_config = replace(base.bigan, batch_size=args.bigan_batch_size)
     seed_config = replace(base.seed, seed=args.seed)
+    # A3C settings: only the two genuinely new knobs are overridable from the
+    # command line; every other A3C quantity is an existing PPO/environment
+    # setting (see config.A3CConfig).
+    a3c_config = replace(
+        base.a3c,
+        n_steps=(
+            base.a3c.n_steps if args.a3c_n_steps is None else args.a3c_n_steps
+        ),
+        bigan_update_interval=(
+            base.a3c.bigan_update_interval
+            if args.a3c_bigan_update_interval is None
+            else args.a3c_bigan_update_interval
+        ),
+    )
     return replace(
         base,
         seed=seed_config,
@@ -457,6 +512,8 @@ def build_config(
         novelty=novelty_config,
         metric_eme=metric_eme_config,
         training=training_config,
+        algorithm=args.algorithm,
+        a3c=a3c_config,
     )
 
 
@@ -507,8 +564,15 @@ def main() -> int:
                 method=args.method,
                 environment_id=args.environment_id,
                 device_label=resolve_device_label(config.training.device.value),
+                extra={"algorithm": config.algorithm},
             )
-            trainer = AdventurerTrainer(environment, config, logger)
+            # Algorithm selection: the only integration branch. PPO keeps its
+            # original trainer; A3C gets the new asynchronous trainer.
+            trainer = (
+                A3CTrainer(environment, config, logger)
+                if config.algorithm == "a3c"
+                else AdventurerTrainer(environment, config, logger)
+            )
             trainer.train()
             trainer.close()
         if args.compare_baseline_directory is not None and args.compare_transition_directory is not None:
