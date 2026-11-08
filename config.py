@@ -45,6 +45,14 @@ TRANSITION_VARIANTS = ("legacy", "master_l2")
 #: action-conditioned transition novelty.
 MASTER_METHODS = ("state", "transition")
 
+#: Reinforcement-learning algorithms the training pipeline can optimise.
+#: ``"ppo"`` is the existing Adventurer implementation and is the default, so
+#: every existing command and configuration keeps its meaning unchanged.
+#: ``"a3c"`` is the additive asynchronous advantage actor-critic agent; it
+#: reuses the same environments, preprocessing, BiGAN, novelty, intrinsic-reward
+#: and log conventions and differs only in the optimisation rule.
+ALGORITHMS = ("ppo", "a3c")
+
 
 @dataclass(frozen=True)
 class SeedConfig:
@@ -436,6 +444,53 @@ class MetricEMEConfig:
 
 
 @dataclass(frozen=True)
+class A3CConfig:
+    """A3C-specific settings: the only knobs A3C adds to the project.
+
+    Everything else A3C needs already exists and is shared with PPO:
+
+    * discounting, GAE lambdas and the intrinsic discount come from
+      :class:`PPOConfig` (``gamma``, ``gae_lambda``, ``intrinsic_gamma``,
+      ``intrinsic_gae_lambda``);
+    * entropy regularisation, value-loss coefficients, gradient-norm clipping,
+      learning rate, Adam epsilon, and the intrinsic advantage coefficient
+      ``beta`` come from :class:`PPOConfig`;
+    * the number of actor-learners is ``EnvironmentConfig.num_parallel_envs``,
+      i.e. the existing ``--num-parallel-envs`` flag; each actor-learner drives
+      exactly one environment, so the flag keeps its original meaning ("how many
+      environments are sampled at once"). ``--seed`` run instructions therefore
+      control both algorithms in the same way.
+    * the novelty type, transition variant, Equation (5) normalization, and the
+      BiGAN configuration come from :class:`NoveltyConfig`, :class:`BiGANConfig`,
+      and :class:`MetricEMEConfig` unchanged.
+
+    ``n_steps`` is the horizon ``n`` of the n-step return
+    ``R_t = sum_(k<n) gamma^k r_(t+k) + gamma^n V(s_(t+n))`` (implemented as the
+    project's GAE recurrence truncated at ``n`` steps), and
+    ``bigan_update_interval`` is how many applied actor-learner updates happen
+    between two BiGAN (and latent forward-model) optimisations, mirroring PPO's
+    "one BiGAN update per PPO update" schedule.
+    """
+
+    n_steps: int = 20
+    bigan_update_interval: int = 1
+
+    def __post_init__(self) -> None:
+        """Validate the A3C schedule.
+
+        Input: The values supplied to this dataclass.
+        Output: No value; raises ``ValueError`` for invalid settings.
+        Mathematical meaning: Guarantees a positive n-step horizon (a return
+            estimator that covers at least one transition) and a positive BiGAN
+            update cadence.
+        """
+        if self.n_steps <= 0:
+            raise ValueError("a3c n_steps must be positive")
+        if self.bigan_update_interval <= 0:
+            raise ValueError("a3c bigan_update_interval must be positive")
+
+
+@dataclass(frozen=True)
 class TrainingConfig:
     """Top-level schedule, logging, checkpoint, and device settings."""
 
@@ -493,6 +548,11 @@ class ExperimentConfig:
     novelty: NoveltyConfig = NoveltyConfig()
     metric_eme: MetricEMEConfig = MetricEMEConfig()
     training: TrainingConfig = TrainingConfig()
+    #: Reinforcement-learning algorithm: ``"ppo"`` (existing implementation,
+    #: default) or ``"a3c"`` (asynchronous actor-critic). Both share the
+    #: environment, preprocessing, BiGAN, novelty, reward, and logging settings.
+    algorithm: str = "ppo"
+    a3c: A3CConfig = A3CConfig()
 
     def __post_init__(self) -> None:
         """Validate relationships spanning multiple configuration sections.
@@ -518,6 +578,22 @@ class ExperimentConfig:
                 "metric_eme replaces the state novelty bonus and cannot be combined "
                 "with novelty_type='transition'"
             )
+        if self.algorithm not in ALGORITHMS:
+            raise ValueError(
+                f"algorithm must be one of {ALGORITHMS}, got {self.algorithm!r}"
+            )
+        if self.algorithm == "a3c":
+            # Every actor-learner consumes whole n-step segments, so the budget
+            # must be an integer number of segments across the workers -- the
+            # exact A3C analogue of PPO's rollout-geometry requirement above.
+            steps_per_segment = (
+                self.environment.num_parallel_envs * self.a3c.n_steps
+            )
+            if self.training.total_environment_steps % steps_per_segment != 0:
+                raise ValueError(
+                    "total_environment_steps must be divisible by "
+                    "num_parallel_envs * a3c.n_steps for algorithm='a3c'"
+                )
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-compatible nested representation of the configuration.
